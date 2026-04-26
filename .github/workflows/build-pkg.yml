@@ -1,0 +1,106 @@
+name: Build mcp-utm package
+
+on:
+  push:
+    tags:
+      - "v*"
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: mcp-utm-pkg-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build .deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install fpm
+        run: |
+          sudo apt-get install -y --no-install-recommends ruby ruby-dev build-essential
+          sudo gem install fpm --no-document
+
+      - name: Assemble package tree
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PKG_ROOT="$(pwd)/pkg-root"
+          SITE_PKG="$PKG_ROOT/usr/lib/python3/dist-packages"
+          BIN="$PKG_ROOT/usr/bin"
+          mkdir -p "$SITE_PKG/mcp_utm" "$BIN"
+
+          cp src/mcp_utm/__init__.py     "$SITE_PKG/mcp_utm/"
+          cp src/mcp_utm/__main__.py     "$SITE_PKG/mcp_utm/"
+          cp src/mcp_utm/applescript.py  "$SITE_PKG/mcp_utm/"
+          cp src/mcp_utm/server.py       "$SITE_PKG/mcp_utm/"
+
+          cat > "$BIN/mcp-utm" <<'WRAPPER'
+          #!/bin/bash
+          exec python3 -m mcp_utm "$@"
+          WRAPPER
+          chmod 0755 "$BIN/mcp-utm"
+
+      - name: Write postinst script
+        run: |
+          cat > postinst.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          if command -v uv &>/dev/null; then
+              uv pip install --system "mcp[cli]>=1.9" --quiet
+          else
+              pip3 install --quiet "mcp[cli]>=1.9"
+          fi
+          EOF
+          chmod 0755 postinst.sh
+
+      - name: Build .deb
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          fpm \
+            -s dir \
+            -t deb \
+            -C pkg-root \
+            -n mcp-utm \
+            -v "$VERSION" \
+            --description "MCP server for UTM virtual machine management via AppleScript" \
+            --url "https://github.com/neverprepared/mcp-utm" \
+            --license MIT \
+            --depends python3 \
+            --architecture all \
+            --after-install postinst.sh \
+            --deb-no-default-config-files \
+            .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-utm-deb
+          path: "*.deb"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.deb"
+          tag_name: ${{ github.ref_name }}
+          name: mcp-utm ${{ github.ref_name }}
+          generate_release_notes: true
