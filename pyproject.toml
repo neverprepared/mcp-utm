@@ -1,6 +1,6 @@
 [project]
 name = "mcp-utm"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for UTM virtual machine management via AppleScript"
 requires-python = ">=3.11"
 dependencies = [
