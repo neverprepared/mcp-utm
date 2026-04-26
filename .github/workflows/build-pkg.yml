@@ -7,6 +7,7 @@ on:
     paths:
       - "src/**"
       - "pyproject.toml"
+      - "package.json"
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +18,8 @@ permissions:
   contents: write
 
 jobs:
-  package:
+  # ── .deb package ──────────────────────────────────────────────────────
+  deb:
     name: Build .deb
     runs-on: ubuntu-latest
     steps:
@@ -39,8 +41,6 @@ jobs:
           sudo gem install fpm --no-document
 
       - name: Assemble package tree
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           PKG_ROOT="$(pwd)/pkg-root"
           SITE_PKG="$PKG_ROOT/usr/lib/python3/dist-packages"
@@ -96,8 +96,65 @@ jobs:
           name: mcp-utm-deb
           path: "*.deb"
 
+  # ── PyPI package ──────────────────────────────────────────────────────
+  pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Resolve version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        run: uv publish
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+
+  # ── npm package ───────────────────────────────────────────────────────
+  npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+
+      - name: Sync version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── GitHub Release ────────────────────────────────────────────────────
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [deb, pypi, npm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mcp-utm-deb
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: "*.deb"
