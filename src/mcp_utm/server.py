@@ -82,9 +82,8 @@ def get_vm_ip(name: str, timeout: int = 60) -> dict:
         name: VM name
         timeout: Seconds to wait for ARP discovery (default: 60)
     """
-    ip = utm.get_vm_ip(name, timeout=timeout)
-    config = utm.get_vm_config(name)
-    return {"name": name, "ip": ip, "mac_address": config.mac_address}
+    ip, mac = utm.get_vm_ip(name, timeout=timeout)
+    return {"name": name, "ip": ip, "mac_address": mac}
 
 
 @mcp.tool()

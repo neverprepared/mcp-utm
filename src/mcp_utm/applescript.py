@@ -6,11 +6,57 @@ Wraps osascript calls to the UTM scripting API. All functions raise
 
 from __future__ import annotations
 
-import json
 import random
+import re
 import subprocess
+import time
 from dataclasses import dataclass
 
+# ---------------------------------------------------------------------------
+# Safety: input validation and escaping
+# ---------------------------------------------------------------------------
+
+_VM_NAME_RE = re.compile(r"^[\w\s\-\.]+$", re.UNICODE)
+_MAC_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
+_VALID_STATUSES = {"stopped", "started", "paused", "starting", "stopping", "pausing", "resuming"}
+_VALID_NETWORK_MODES = {"shared", "bridged", "host", "emulated"}
+_MAX_TIMEOUT = 600  # seconds
+_MAX_MEMORY_MIB = 1048576  # 1 TiB
+_MAX_CPU_CORES = 256
+
+
+def _esc(value: str) -> str:
+    """Escape a string for safe interpolation into AppleScript double-quoted literals."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _validate_vm_name(name: str) -> str:
+    if not name or not _VM_NAME_RE.match(name):
+        raise ValueError(f"Invalid VM name: {name!r} — only word characters, spaces, hyphens, and dots allowed")
+    return name
+
+
+def _validate_mac(mac: str) -> str:
+    if not _MAC_RE.match(mac):
+        raise ValueError(f"Invalid MAC address: {mac!r} — expected format aa:bb:cc:dd:ee:ff")
+    return mac
+
+
+def _validate_path(path: str) -> str:
+    if not path.startswith("/"):
+        raise ValueError(f"Path must be absolute: {path!r}")
+    if ".." in path.split("/"):
+        raise ValueError(f"Path traversal not allowed: {path!r}")
+    return path
+
+
+def _validate_timeout(timeout: int) -> int:
+    return max(1, min(timeout, _MAX_TIMEOUT))
+
+
+# ---------------------------------------------------------------------------
+# osascript runner
+# ---------------------------------------------------------------------------
 
 def _run(script: str, timeout: int = 30) -> str:
     """Execute an AppleScript snippet and return stdout."""
@@ -21,15 +67,19 @@ def _run(script: str, timeout: int = 30) -> str:
         timeout=timeout,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"osascript failed (rc={result.returncode})")
+        err = result.stderr.strip()
+        if "Application can" in err and "found" in err:
+            raise RuntimeError("UTM is not running. Launch UTM and try again.")
+        raise RuntimeError(err or f"osascript failed (rc={result.returncode})")
     return result.stdout.strip()
 
 
-def _run_json(script: str, timeout: int = 30) -> dict | list:
-    """Execute AppleScript that prints JSON and parse the result."""
-    # Wrap in a JXA (JavaScript for Automation) call for clean JSON output
-    raw = _run(script, timeout=timeout)
-    return json.loads(raw) if raw else {}
+def _parse_int(value: str) -> int:
+    """Parse an integer from AppleScript output, handling floats."""
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return 0
 
 
 def generate_mac() -> str:
@@ -72,6 +122,16 @@ class VMConfig:
         }
 
 
+@dataclass
+class DriveInfo:
+    id: str
+    removable: bool
+    host_size_mib: int
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "removable": self.removable, "host_size_mib": self.host_size_mib}
+
+
 # ---------------------------------------------------------------------------
 # VM listing and status
 # ---------------------------------------------------------------------------
@@ -105,9 +165,10 @@ def list_vms() -> list[VMInfo]:
 
 def get_vm_status(name: str) -> str:
     """Get the status of a VM by name."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         return status of vm as text
     end tell
     '''
@@ -116,9 +177,10 @@ def get_vm_status(name: str) -> str:
 
 def get_vm_config(name: str) -> VMConfig:
     """Read configuration of a VM."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set conf to configuration of vm
         set vmName to name of conf
         set vmMem to memory of conf
@@ -138,9 +200,9 @@ def get_vm_config(name: str) -> VMConfig:
     raw = _run(script)
     parts = raw.split("||")
     return VMConfig(
-        name=parts[0],
-        memory=int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0,
-        cpu_cores=int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0,
+        name=parts[0] if len(parts) > 0 else "",
+        memory=_parse_int(parts[1]) if len(parts) > 1 else 0,
+        cpu_cores=_parse_int(parts[2]) if len(parts) > 2 else 0,
         mac_address=parts[3] if len(parts) > 3 else "",
         network_mode=parts[4] if len(parts) > 4 else "",
     )
@@ -156,26 +218,27 @@ def clone_vm(template_name: str, new_name: str, randomize_mac: bool = True) -> V
     Uses AppleScript ``duplicate`` + ``update configuration`` so UTM's
     in-memory state is updated (unlike raw plist edits).
     """
+    _validate_vm_name(template_name)
+    _validate_vm_name(new_name)
     new_mac = generate_mac() if randomize_mac else ""
 
-    # Step 1: duplicate and set name + MAC in one shot
     if new_mac:
         script = f'''
         tell application "UTM"
-            set tmpl to virtual machine named "{template_name}"
-            duplicate tmpl with properties {{configuration:{{name:"{new_name}"}}}}
-            set vm to virtual machine named "{new_name}"
+            set tmpl to virtual machine named "{_esc(template_name)}"
+            duplicate tmpl with properties {{configuration:{{name:"{_esc(new_name)}"}}}}
+            set vm to virtual machine named "{_esc(new_name)}"
             set conf to configuration of vm
             set nic to item 1 of (network interfaces of conf)
-            set address of nic to "{new_mac}"
+            set address of nic to "{_esc(new_mac)}"
             update configuration of vm with conf
         end tell
         '''
     else:
         script = f'''
         tell application "UTM"
-            set tmpl to virtual machine named "{template_name}"
-            duplicate tmpl with properties {{configuration:{{name:"{new_name}"}}}}
+            set tmpl to virtual machine named "{_esc(template_name)}"
+            duplicate tmpl with properties {{configuration:{{name:"{_esc(new_name)}"}}}}
         end tell
         '''
     _run(script, timeout=600)
@@ -185,9 +248,10 @@ def clone_vm(template_name: str, new_name: str, randomize_mac: bool = True) -> V
 
 def start_vm(name: str) -> str:
     """Start a VM. Returns status after start command."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         start vm
         return status of vm as text
     end tell
@@ -197,10 +261,11 @@ def start_vm(name: str) -> str:
 
 def stop_vm(name: str, force: bool = False) -> str:
     """Stop a VM. Returns status after stop command."""
+    _validate_vm_name(name)
     method = "by force" if force else ""
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         stop vm {method}
         return status of vm as text
     end tell
@@ -210,95 +275,14 @@ def stop_vm(name: str, force: bool = False) -> str:
 
 def delete_vm(name: str) -> bool:
     """Delete a VM. Returns True on success."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        delete virtual machine named "{name}"
+        delete virtual machine named "{_esc(name)}"
     end tell
     '''
     _run(script, timeout=60)
     return True
-
-
-# ---------------------------------------------------------------------------
-# Networking
-# ---------------------------------------------------------------------------
-
-def get_vm_ip(name: str, timeout: int = 60) -> str:
-    """Discover VM IP via ARP table by reading its MAC from UTM config.
-
-    Polls ARP every 2 seconds until the MAC appears or timeout is reached.
-    """
-    config = get_vm_config(name)
-    mac = config.mac_address.lower()
-    if not mac:
-        raise RuntimeError(f"No MAC address found for VM '{name}'")
-
-    # ARP output may strip leading zeros from MAC octets (e.g. 0e → e).
-    # Build a normalized form for matching.
-    mac_stripped = ":".join(p.lstrip("0") or "0" for p in mac.split(":"))
-
-    import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = subprocess.run(["arp", "-a"], capture_output=True, text=True)
-        for line in result.stdout.split("\n"):
-            line_lower = line.lower()
-            if mac in line_lower or mac_stripped in line_lower:
-                # Parse IP from "? (192.168.64.x) at aa:bb:cc:dd:ee:ff ..."
-                start = line.find("(")
-                end = line.find(")")
-                if start != -1 and end != -1:
-                    return line[start + 1 : end]
-        time.sleep(2)
-
-    raise TimeoutError(f"IP not found for VM '{name}' (MAC: {mac}) after {timeout}s")
-
-
-def set_vm_network(name: str, mac_address: str | None = None, mode: str | None = None) -> VMConfig:
-    """Update network configuration of a stopped VM."""
-    parts = []
-    if mac_address:
-        parts.append(f'set address of nic to "{mac_address}"')
-    if mode:
-        parts.append(f'set mode of nic to {mode}')
-    if not parts:
-        return get_vm_config(name)
-
-    updates = "\n            ".join(parts)
-    script = f'''
-    tell application "UTM"
-        set vm to virtual machine named "{name}"
-        set conf to configuration of vm
-        set nic to item 1 of (network interfaces of conf)
-        {updates}
-        update configuration of vm with conf
-    end tell
-    '''
-    _run(script)
-    return get_vm_config(name)
-
-
-def set_vm_resources(name: str, memory: int | None = None, cpu_cores: int | None = None) -> VMConfig:
-    """Update memory and/or CPU cores of a stopped VM."""
-    parts = []
-    if memory is not None:
-        parts.append(f"set memory of conf to {memory}")
-    if cpu_cores is not None:
-        parts.append(f"set cpu cores of conf to {cpu_cores}")
-    if not parts:
-        return get_vm_config(name)
-
-    updates = "\n            ".join(parts)
-    script = f'''
-    tell application "UTM"
-        set vm to virtual machine named "{name}"
-        set conf to configuration of vm
-        {updates}
-        update configuration of vm with conf
-    end tell
-    '''
-    _run(script)
-    return get_vm_config(name)
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +291,11 @@ def set_vm_resources(name: str, memory: int | None = None, cpu_cores: int | None
 
 def suspend_vm(name: str, save: bool = True) -> str:
     """Suspend a running VM to memory. Optionally save state to disk."""
+    _validate_vm_name(name)
     saving = "with saving" if save else "without saving"
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         suspend vm {saving}
         return status of vm as text
     end tell
@@ -324,11 +309,13 @@ def suspend_vm(name: str, save: bool = True) -> str:
 
 def rename_vm(name: str, new_name: str) -> VMConfig:
     """Rename a stopped VM via update configuration."""
+    _validate_vm_name(name)
+    _validate_vm_name(new_name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set conf to configuration of vm
-        set name of conf to "{new_name}"
+        set name of conf to "{_esc(new_name)}"
         update configuration of vm with conf
     end tell
     '''
@@ -342,9 +329,10 @@ def rename_vm(name: str, new_name: str) -> VMConfig:
 
 def get_serial_port(name: str) -> dict:
     """Get the first serial port's interface and address (ptty path or TCP info)."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set ports to serial ports of vm
         if (count of ports) > 0 then
             set p to item 1 of ports
@@ -364,10 +352,10 @@ def get_serial_port(name: str) -> dict:
     parts = raw.split("||")
     return {
         "available": True,
-        "id": int(parts[0]) if parts[0].isdigit() else 0,
+        "id": _parse_int(parts[0]) if len(parts) > 0 else 0,
         "interface": parts[1] if len(parts) > 1 else "",
         "address": parts[2] if len(parts) > 2 else "",
-        "port": int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0,
+        "port": _parse_int(parts[3]) if len(parts) > 3 else 0,
     }
 
 
@@ -376,21 +364,112 @@ def get_serial_port(name: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def wait_for_vm(name: str, target_status: str = "started", timeout: int = 120) -> str:
-    """Poll VM status until it matches target or timeout is reached.
+    """Poll VM status until it matches target or timeout is reached."""
+    _validate_vm_name(name)
+    if target_status not in _VALID_STATUSES:
+        raise ValueError(f"Invalid target_status '{target_status}'. Must be one of: {_VALID_STATUSES}")
+    timeout = _validate_timeout(timeout)
 
-    Args:
-        name: VM name
-        target_status: One of "stopped", "started", "paused"
-        timeout: Seconds to wait
-    """
-    import time
+    status = get_vm_status(name)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status = get_vm_status(name)
         if status == target_status:
             return status
         time.sleep(2)
+        status = get_vm_status(name)
     raise TimeoutError(f"VM '{name}' did not reach '{target_status}' within {timeout}s (current: {status})")
+
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+
+def get_vm_ip(name: str, timeout: int = 60) -> tuple[str, str]:
+    """Discover VM IP via ARP table by reading its MAC from UTM config.
+
+    Returns (ip_address, mac_address) tuple.
+    """
+    _validate_vm_name(name)
+    timeout = _validate_timeout(timeout)
+    config = get_vm_config(name)
+    mac = config.mac_address.lower()
+    if not mac:
+        raise RuntimeError(f"No MAC address found for VM '{name}'")
+
+    # ARP output may strip leading zeros from MAC octets (e.g. 0e → e).
+    mac_stripped = ":".join(p.lstrip("0") or "0" for p in mac.split(":"))
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+        for line in result.stdout.split("\n"):
+            line_lower = line.lower()
+            if mac in line_lower or mac_stripped in line_lower:
+                start = line.find("(")
+                end = line.find(")")
+                if start != -1 and end != -1:
+                    return line[start + 1 : end], config.mac_address
+        time.sleep(2)
+
+    raise TimeoutError(f"IP not found for VM '{name}' (MAC: {mac}) after {timeout}s")
+
+
+def set_vm_network(name: str, mac_address: str | None = None, mode: str | None = None) -> VMConfig:
+    """Update network configuration of a stopped VM."""
+    _validate_vm_name(name)
+    parts = []
+    if mac_address:
+        _validate_mac(mac_address)
+        parts.append(f'set address of nic to "{_esc(mac_address)}"')
+    if mode:
+        if mode not in _VALID_NETWORK_MODES:
+            raise ValueError(f"Invalid network mode '{mode}'. Must be one of: {_VALID_NETWORK_MODES}")
+        parts.append(f"set mode of nic to {mode}")
+    if not parts:
+        return get_vm_config(name)
+
+    updates = "\n            ".join(parts)
+    script = f'''
+    tell application "UTM"
+        set vm to virtual machine named "{_esc(name)}"
+        set conf to configuration of vm
+        set nic to item 1 of (network interfaces of conf)
+        {updates}
+        update configuration of vm with conf
+    end tell
+    '''
+    _run(script)
+    return get_vm_config(name)
+
+
+def set_vm_resources(name: str, memory: int | None = None, cpu_cores: int | None = None) -> VMConfig:
+    """Update memory and/or CPU cores of a stopped VM."""
+    _validate_vm_name(name)
+    parts = []
+    if memory is not None:
+        memory = int(memory)
+        if memory < 64 or memory > _MAX_MEMORY_MIB:
+            raise ValueError(f"Memory must be 64–{_MAX_MEMORY_MIB} MiB, got {memory}")
+        parts.append(f"set memory of conf to {memory}")
+    if cpu_cores is not None:
+        cpu_cores = int(cpu_cores)
+        if cpu_cores < 1 or cpu_cores > _MAX_CPU_CORES:
+            raise ValueError(f"CPU cores must be 1–{_MAX_CPU_CORES}, got {cpu_cores}")
+        parts.append(f"set cpu cores of conf to {cpu_cores}")
+    if not parts:
+        return get_vm_config(name)
+
+    updates = "\n            ".join(parts)
+    script = f'''
+    tell application "UTM"
+        set vm to virtual machine named "{_esc(name)}"
+        set conf to configuration of vm
+        {updates}
+        update configuration of vm with conf
+    end tell
+    '''
+    _run(script)
+    return get_vm_config(name)
 
 
 # ---------------------------------------------------------------------------
@@ -399,10 +478,12 @@ def wait_for_vm(name: str, target_status: str = "started", timeout: int = 120) -
 
 def export_vm(name: str, path: str) -> bool:
     """Export a VM to a .utm file at the given path."""
+    _validate_vm_name(name)
+    _validate_path(path)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
-        set dest to POSIX file "{path}"
+        set vm to virtual machine named "{_esc(name)}"
+        set dest to POSIX file "{_esc(path)}"
         export vm to dest
     end tell
     '''
@@ -412,9 +493,10 @@ def export_vm(name: str, path: str) -> bool:
 
 def import_vm(path: str) -> VMInfo:
     """Import a VM from a .utm file. Returns the imported VM info."""
+    _validate_path(path)
     script = f'''
     tell application "UTM"
-        set src to POSIX file "{path}"
+        set src to POSIX file "{_esc(path)}"
         set vm to import new virtual machine from src
         set vmId to id of vm
         set vmName to name of vm
@@ -425,6 +507,8 @@ def import_vm(path: str) -> VMInfo:
     '''
     raw = _run(script, timeout=600)
     parts = raw.split("||")
+    if len(parts) < 4:
+        raise RuntimeError(f"Unexpected import result: {raw!r}")
     return VMInfo(id=parts[0], name=parts[1], status=parts[2], backend=parts[3])
 
 
@@ -432,21 +516,12 @@ def import_vm(path: str) -> VMInfo:
 # Drives
 # ---------------------------------------------------------------------------
 
-@dataclass
-class DriveInfo:
-    id: str
-    removable: bool
-    host_size_mib: int
-
-    def to_dict(self) -> dict:
-        return {"id": self.id, "removable": self.removable, "host_size_mib": self.host_size_mib}
-
-
 def list_vm_drives(name: str) -> list[DriveInfo]:
     """List drives attached to a VM."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set conf to configuration of vm
         set drvs to drives of conf
         set output to ""
@@ -470,27 +545,24 @@ def list_vm_drives(name: str) -> list[DriveInfo]:
             drives.append(DriveInfo(
                 id=parts[0],
                 removable=parts[1].lower() == "true",
-                host_size_mib=int(parts[2]) if parts[2].isdigit() else 0,
+                host_size_mib=_parse_int(parts[2]),
             ))
     return drives
 
 
 def attach_drive(name: str, drive_id: str, source_path: str) -> bool:
-    """Attach an ISO or disk image to a removable drive on a stopped VM.
-
-    Args:
-        name: VM name (must be stopped)
-        drive_id: Drive ID (from list_vm_drives)
-        source_path: Path to ISO or disk image
-    """
+    """Attach an ISO or disk image to a removable drive on a stopped VM."""
+    _validate_vm_name(name)
+    _validate_path(source_path)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set conf to configuration of vm
         set drvs to drives of conf
-        repeat with d in drvs
-            if id of d is "{drive_id}" then
-                set item 1 of (drvs whose id is "{drive_id}") to {{id:"{drive_id}", source:POSIX file "{source_path}"}}
+        repeat with i from 1 to count of drvs
+            set d to item i of drvs
+            if id of d is "{_esc(drive_id)}" then
+                set source of d to POSIX file "{_esc(source_path)}"
                 exit repeat
             end if
         end repeat
@@ -502,18 +574,15 @@ def attach_drive(name: str, drive_id: str, source_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Display
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Directory shares (VirtioFS)
 # ---------------------------------------------------------------------------
 
 def list_vm_shares(name: str) -> list[str]:
     """List shared directories registered for a VM. Returns POSIX paths."""
+    _validate_vm_name(name)
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set shares to registry of vm
         set output to ""
         repeat with s in shares
@@ -527,27 +596,23 @@ def list_vm_shares(name: str) -> list[str]:
 
 
 def set_vm_shares(name: str, paths: list[str]) -> list[str]:
-    """Replace all shared directories for a VM.
+    """Replace all shared directories for a VM."""
+    _validate_vm_name(name)
+    for p in paths:
+        _validate_path(p)
 
-    Uses ``update registry`` which creates security-scoped bookmarks,
-    allowing VirtioFS mounts to survive across boots.
-
-    Args:
-        name: VM name (must be stopped)
-        paths: List of host POSIX paths to share
-    """
     if not paths:
         script = f'''
         tell application "UTM"
-            set vm to virtual machine named "{name}"
+            set vm to virtual machine named "{_esc(name)}"
             update registry of vm with {{}}
         end tell
         '''
     else:
-        share_items = ", ".join(f'POSIX file "{p}"' for p in paths)
+        share_items = ", ".join(f'POSIX file "{_esc(p)}"' for p in paths)
         script = f'''
         tell application "UTM"
-            set vm to virtual machine named "{name}"
+            set vm to virtual machine named "{_esc(name)}"
             update registry of vm with {{{share_items}}}
         end tell
         '''
@@ -556,14 +621,9 @@ def set_vm_shares(name: str, paths: list[str]) -> list[str]:
 
 
 def add_vm_share(name: str, path: str) -> list[str]:
-    """Add a shared directory to a VM without removing existing shares.
-
-    Args:
-        name: VM name (must be stopped)
-        path: Host POSIX path to share
-    """
+    """Add a shared directory to a VM without removing existing shares."""
+    _validate_path(path)
     current = list_vm_shares(name)
-    # Normalize trailing slashes for dedup
     normalized = path.rstrip("/")
     existing = [p.rstrip("/") for p in current]
     if normalized in existing:
@@ -573,17 +633,12 @@ def add_vm_share(name: str, path: str) -> list[str]:
 
 
 def remove_vm_share(name: str, path: str) -> list[str]:
-    """Remove a shared directory from a VM.
-
-    Args:
-        name: VM name (must be stopped)
-        path: Host POSIX path to remove
-    """
+    """Remove a shared directory from a VM."""
     current = list_vm_shares(name)
     normalized = path.rstrip("/")
     updated = [p for p in current if p.rstrip("/") != normalized]
     if len(updated) == len(current):
-        return current  # nothing to remove
+        return current
     return set_vm_shares(name, updated)
 
 
@@ -593,10 +648,11 @@ def remove_vm_share(name: str, path: str) -> list[str]:
 
 def set_vm_display(name: str, dynamic_resolution: bool) -> bool:
     """Toggle dynamic resolution on the first display of a stopped VM."""
+    _validate_vm_name(name)
     val = "true" if dynamic_resolution else "false"
     script = f'''
     tell application "UTM"
-        set vm to virtual machine named "{name}"
+        set vm to virtual machine named "{_esc(name)}"
         set conf to configuration of vm
         set disps to displays of conf
         if (count of disps) > 0 then
