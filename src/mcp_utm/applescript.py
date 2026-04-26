@@ -16,7 +16,7 @@ from dataclasses import dataclass
 # Safety: input validation and escaping
 # ---------------------------------------------------------------------------
 
-_VM_NAME_RE = re.compile(r"^[\w\s\-\.]+$", re.UNICODE)
+_VM_NAME_RE = re.compile(r"\A[\w \-\.]+\Z", re.UNICODE)
 _MAC_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 _VALID_STATUSES = {"stopped", "started", "paused", "starting", "stopping", "pausing", "resuming"}
 _VALID_NETWORK_MODES = {"shared", "bridged", "host", "emulated"}
