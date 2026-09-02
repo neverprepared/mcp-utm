@@ -63,9 +63,9 @@ jobs:
           #!/bin/bash
           set -e
           if command -v uv &>/dev/null; then
-              uv pip install --system "mcp[cli]>=1.9" --quiet
+              uv pip install --system "mcp[cli]>=2.0,<3" --quiet
           else
-              pip3 install --quiet "mcp[cli]>=1.9"
+              pip3 install --quiet "mcp[cli]>=2.0,<3"
           fi
           EOF
           chmod 0755 postinst.sh
