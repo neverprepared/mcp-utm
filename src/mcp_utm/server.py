@@ -7,11 +7,11 @@ the AppleScript ``update configuration`` API.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from . import applescript as utm
 
-mcp = FastMCP("utm")
+mcp = MCPServer("utm")
 
 
 @mcp.tool()
