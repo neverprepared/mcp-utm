@@ -59,13 +59,19 @@ jobs:
 
       - name: Write postinst script
         run: |
+          # NOTE: this restates pyproject.toml's mcp constraint because the
+          # package ships as source plus a `python3 -m mcp_utm` wrapper, so
+          # there is no wheel whose own dependency could be resolved here. It
+          # must be kept in step with pyproject.toml by hand — it was left at
+          # ">=1.9" through the move to mcp 2.x, which would have installed an
+          # SDK the code no longer works against.
           cat > postinst.sh <<'EOF'
           #!/bin/bash
           set -e
           if command -v uv &>/dev/null; then
-              uv pip install --system "mcp[cli]>=1.9" --quiet
+              uv pip install --system "mcp[cli]>=2.3,<3" --quiet
           else
-              pip3 install --quiet "mcp[cli]>=1.9"
+              pip3 install --quiet "mcp[cli]>=2.3,<3"
           fi
           EOF
           chmod 0755 postinst.sh
